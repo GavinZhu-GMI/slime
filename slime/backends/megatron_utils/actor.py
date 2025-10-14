@@ -27,14 +27,7 @@ from .cp_utils import slice_log_prob_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import (
-    apply_optimizer_step_only,
-    forward_backward_only,
-    forward_only,
-    initialize_model_and_optimizer,
-    save,
-    train,
-)
+from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
 
 
@@ -403,7 +396,8 @@ class MegatronTrainRayActor(TrainRayActor):
         """
         Perform forward + backward pass only, accumulating gradients WITHOUT optimizer.step().
 
-        This enables gradient accumulation for Tinker API integration.
+        This enables gradient accumulation by calling Megatron's forward_backward_func directly
+        without the optimizer step.
 
         Args:
             rollout_id: Rollout identifier
@@ -414,6 +408,18 @@ class MegatronTrainRayActor(TrainRayActor):
         Returns:
             Dictionary with loss, grad_norm, and valid_step information
         """
+        import math
+        import os
+        from functools import partial
+
+        from megatron.core import mpu
+        from megatron.core.models.gpt import GPTModel
+        from megatron.core.pipeline_parallel import get_forward_backward_func
+        from megatron.training.global_vars import get_args
+
+        from .data import get_batch
+        from .loss import loss_function
+
         Timer().end("train_wait")
 
         if self.args.offload:
@@ -426,17 +432,100 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
         with timer("forward_backward_only"):
-            loss_dict, grad_norm, valid_step = forward_backward_only(
-                self.args,
-                rollout_id,
-                0,  # step_id
-                data_iterator,
-                self.model,
-                self.optimizer,
-                self.opt_param_scheduler,
-                num_microbatches[0],
-                zero_grads=zero_grads,
+            args = get_args()
+
+            # Optionally zero gradients (only for first accumulation step)
+            if zero_grads:
+                for model_chunk in self.model:
+                    model_chunk.zero_grad_buffer()
+                self.optimizer.zero_grad()
+
+            if args.custom_megatron_before_train_step_hook_path:
+                from slime.utils.misc import load_function
+
+                custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
+                custom_before_train_step_hook(args, rollout_id, 0, self.model, self.optimizer, self.opt_param_scheduler)
+
+            def forward_step(data_iterator, model: GPTModel):
+                """Forward training step."""
+                batch = get_batch(
+                    data_iterator,
+                    [
+                        "tokens",
+                        "packed_seq_params",
+                        "total_lengths",
+                        "response_lengths",
+                        "loss_masks",
+                        "log_probs",
+                        "ref_log_probs",
+                        "values",
+                        "advantages",
+                        "returns",
+                        "rollout_log_probs",
+                    ],
+                )
+
+                if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+                    old_stage = os.environ["ROUTING_REPLAY_STAGE"]
+                    os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+
+                output_tensor = model(
+                    input_ids=batch["tokens"],
+                    position_ids=None,
+                    attention_mask=None,
+                    labels=None,
+                    packed_seq_params=batch["packed_seq_params"],
+                )
+
+                if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+                    os.environ["ROUTING_REPLAY_STAGE"] = old_stage
+
+                return output_tensor, partial(loss_function, args, batch, num_microbatches[0])
+
+            # Call Megatron's forward_backward_func directly
+            forward_backward_func = get_forward_backward_func()
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=self.model,
+                num_microbatches=num_microbatches[0],
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
             )
+
+            # Validate gradients
+            valid_step = True
+            grad_norm = None
+            if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+                found_inf_flag = self.optimizer.prepare_grads()
+                if found_inf_flag:
+                    valid_step = False
+                else:
+                    grad_norm = self.optimizer.get_grad_norm()
+                    if isinstance(grad_norm, torch.Tensor):
+                        valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+                    else:
+                        valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+
+            # Compute loss metrics
+            loss_dict = {}
+            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                keys = losses_reduced[0]["keys"]
+                values = None
+                for x in losses_reduced:
+                    if values is None:
+                        values = x["values"]
+                    else:
+                        values += x["values"]
+                assert len(keys) + 1 == values.numel()
+                torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+
+                values = values.tolist()
+                num_samples_or_tokens = values[0]
+                for key, value in zip(keys, values[1:]):
+                    loss_dict[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
 
         Timer().start("train_wait")
 
@@ -450,22 +539,34 @@ class MegatronTrainRayActor(TrainRayActor):
         """
         Apply optimizer step using accumulated gradients.
 
-        This enables gradient accumulation for Tinker API integration.
-        Must be called after one or more forward_backward_step_only() calls.
+        This enables gradient accumulation by applying the optimizer step
+        and zeroing gradients after.
 
         Returns:
             Dictionary with success status and grad_norm
         """
+        from megatron.training.global_vars import get_args
+
         with timer("apply_optimizer_step"):
-            success, grad_norm = apply_optimizer_step_only(
-                self.args, self.optimizer, self.opt_param_scheduler
-            )
+            args = get_args()
+
+            # Apply optimizer step
+            update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+
+            # Update learning rate scheduler
+            if update_successful:
+                self.opt_param_scheduler.step(increment=args.global_batch_size)
+
+            # Zero gradients after applying them
+            for model_chunk in self.model:
+                model_chunk.zero_grad_buffer()
+            self.optimizer.zero_grad()
 
             # Update CPU weight cache after applying optimizer step
             self.update_cpu_params_dict(self.weights["actor"])
 
         return {
-            "success": success,
+            "success": update_successful,
             "grad_norm": grad_norm if grad_norm is not None else 0.0,
         }
 
