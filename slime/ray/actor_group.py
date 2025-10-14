@@ -138,3 +138,37 @@ class RayTrainGroup:
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+
+    def forward_backward_only(self, rollout_id, rollout_data_ref, zero_grads=False):
+        """
+        Perform forward + backward pass only, accumulating gradients WITHOUT optimizer.step().
+
+        This enables gradient accumulation for Tinker API integration.
+
+        Args:
+            rollout_id: Rollout identifier
+            rollout_data_ref: Reference to rollout data
+            zero_grads: If True, zero gradients before forward pass (first accumulation step).
+                       If False, accumulate on top of existing gradients (subsequent steps).
+
+        Returns:
+            List of results from all actors (loss, grad_norm, valid_step)
+        """
+        return ray.get(
+            [
+                actor.forward_backward_step_only.remote(rollout_id, rollout_data_ref, zero_grads)
+                for actor in self._actor_handlers
+            ]
+        )
+
+    def apply_optimizer_step(self):
+        """
+        Apply optimizer step using accumulated gradients.
+
+        This enables gradient accumulation for Tinker API integration.
+        Must be called after one or more forward_backward_only() calls.
+
+        Returns:
+            List of results from all actors (success, grad_norm)
+        """
+        return ray.get([actor.apply_optimizer_step.remote() for actor in self._actor_handlers])

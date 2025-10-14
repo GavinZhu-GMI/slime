@@ -363,6 +363,148 @@ def train_one_step(args, rollout_id, step_id, data_iterator, model, optimizer, o
     return {}, grad_norm
 
 
+def forward_backward_only(
+    args, rollout_id, step_id, data_iterator, model, optimizer, opt_param_scheduler, num_microbatches, zero_grads=False
+):
+    """
+    Forward + backward pass only, accumulating gradients WITHOUT optimizer.step().
+
+    This enables gradient accumulation for Tinker API integration.
+
+    Args:
+        zero_grads: If True, zero gradients before forward pass (first accumulation step).
+                    If False, accumulate on top of existing gradients (subsequent steps).
+
+    Returns:
+        loss_dict: Dictionary of computed losses
+        grad_norm: Gradient norm (if valid_step is True, otherwise None)
+    """
+    args = get_args()
+
+    # Optionally zero gradients (only for first accumulation step)
+    if zero_grads:
+        for model_chunk in model:
+            model_chunk.zero_grad_buffer()
+        optimizer.zero_grad()
+
+    if args.custom_megatron_before_train_step_hook_path:
+        from slime.utils.misc import load_function
+
+        custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
+        custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+
+    def forward_step(data_iterator, model: GPTModel):
+        """Forward training step."""
+        batch = get_batch(
+            data_iterator,
+            [
+                "tokens",
+                "packed_seq_params",
+                "total_lengths",
+                "response_lengths",
+                "loss_masks",
+                "log_probs",
+                "ref_log_probs",
+                "values",
+                "advantages",
+                "returns",
+                "rollout_log_probs",
+            ],
+        )
+
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+            old_stage = os.environ["ROUTING_REPLAY_STAGE"]
+            os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
+
+        output_tensor = model(
+            input_ids=batch["tokens"],
+            position_ids=None,
+            attention_mask=None,
+            labels=None,
+            packed_seq_params=batch["packed_seq_params"],
+        )
+
+        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
+            os.environ["ROUTING_REPLAY_STAGE"] = old_stage
+
+        return output_tensor, partial(loss_function, args, batch, num_microbatches)
+
+    # Forward + backward pass
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False,
+    )
+
+    # Validate gradients
+    valid_step = True
+    grad_norm = None
+    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+        found_inf_flag = optimizer.prepare_grads()
+        if found_inf_flag:
+            valid_step = False
+        else:
+            grad_norm = optimizer.get_grad_norm()
+            if isinstance(grad_norm, torch.Tensor):
+                valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+            else:
+                valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+
+    # Compute loss metrics
+    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        keys = losses_reduced[0]["keys"]
+        values = None
+        for x in losses_reduced:
+            if values is None:
+                values = x["values"]
+            else:
+                values += x["values"]
+        assert len(keys) + 1 == values.numel()
+        torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+
+        loss_reduced = {}
+        values = values.tolist()
+        num_samples_or_tokens = values[0]
+        for key, value in zip(keys, values[1:]):
+            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+        return loss_reduced, grad_norm, valid_step
+    return {}, grad_norm, valid_step
+
+
+def apply_optimizer_step_only(args, optimizer, opt_param_scheduler):
+    """
+    Apply optimizer step using accumulated gradients.
+
+    This enables gradient accumulation for Tinker API integration.
+    Must be called after one or more forward_backward_only() calls.
+
+    Returns:
+        success: Whether the optimizer step was successful
+        grad_norm: Gradient norm
+    """
+    args = get_args()
+
+    # Apply optimizer step
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    # Update learning rate scheduler
+    if update_successful:
+        opt_param_scheduler.step(increment=args.global_batch_size)
+
+    # Zero gradients after applying them
+    for model_chunk in optimizer.models:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    return update_successful, grad_norm
+
+
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
     return args.use_distributed_optimizer and args.overlap_param_gather

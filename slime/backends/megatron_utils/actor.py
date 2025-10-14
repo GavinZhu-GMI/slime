@@ -27,7 +27,14 @@ from .cp_utils import slice_log_prob_with_cp
 from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
-from .model import forward_only, initialize_model_and_optimizer, save, train
+from .model import (
+    apply_optimizer_step_only,
+    forward_backward_only,
+    forward_only,
+    initialize_model_and_optimizer,
+    save,
+    train,
+)
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
 
 
@@ -389,6 +396,78 @@ class MegatronTrainRayActor(TrainRayActor):
 
         log_perf_data(rollout_id, self.args)
         Timer().start("train_wait")
+
+    def forward_backward_step_only(
+        self, rollout_id: int, rollout_data_ref: Box, zero_grads: bool = False
+    ) -> Dict[str, float]:
+        """
+        Perform forward + backward pass only, accumulating gradients WITHOUT optimizer.step().
+
+        This enables gradient accumulation for Tinker API integration.
+
+        Args:
+            rollout_id: Rollout identifier
+            rollout_data_ref: Reference to rollout data
+            zero_grads: If True, zero gradients before forward pass (first accumulation step).
+                       If False, accumulate on top of existing gradients (subsequent steps).
+
+        Returns:
+            Dictionary with loss, grad_norm, and valid_step information
+        """
+        Timer().end("train_wait")
+
+        if self.args.offload:
+            self.wake_up(("model"))
+
+        with timer("data_preprocess"):
+            rollout_data = self._get_rollout_data(rollout_data_ref)
+
+        # Create data iterator
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        with timer("forward_backward_only"):
+            loss_dict, grad_norm, valid_step = forward_backward_only(
+                self.args,
+                rollout_id,
+                0,  # step_id
+                data_iterator,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                num_microbatches[0],
+                zero_grads=zero_grads,
+            )
+
+        Timer().start("train_wait")
+
+        return {
+            "loss": loss_dict,
+            "grad_norm": grad_norm if grad_norm is not None else 0.0,
+            "valid_step": valid_step,
+        }
+
+    def apply_optimizer_step(self) -> Dict[str, float]:
+        """
+        Apply optimizer step using accumulated gradients.
+
+        This enables gradient accumulation for Tinker API integration.
+        Must be called after one or more forward_backward_step_only() calls.
+
+        Returns:
+            Dictionary with success status and grad_norm
+        """
+        with timer("apply_optimizer_step"):
+            success, grad_norm = apply_optimizer_step_only(
+                self.args, self.optimizer, self.opt_param_scheduler
+            )
+
+            # Update CPU weight cache after applying optimizer step
+            self.update_cpu_params_dict(self.weights["actor"])
+
+        return {
+            "success": success,
+            "grad_norm": grad_norm if grad_norm is not None else 0.0,
+        }
 
     def save_model(self, iteration: int) -> None:
         if self.args.debug_rollout_only:
