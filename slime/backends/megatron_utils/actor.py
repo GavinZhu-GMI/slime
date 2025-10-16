@@ -217,6 +217,23 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["rollout_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
                 )
             ]
+
+        # Move RL fields to GPU if they exist and are not already on GPU
+        # This is needed for external APIs (like GMI wrapper) that provide pre-computed RL fields
+        # In normal Slime training, these fields come from GPU forward passes and don't need moving
+        if getattr(self.args, 'move_rl_fields_to_gpu', False):
+            for field in ["log_probs", "ref_log_probs", "advantages", "returns", "values"]:
+                if field in rollout_data and rollout_data[field]:
+                    # Check if first tensor is already on GPU to avoid unnecessary transfers
+                    first_tensor = rollout_data[field][0]
+                    if isinstance(first_tensor, torch.Tensor) and not first_tensor.is_cuda:
+                        rollout_data[field] = [
+                            torch.tensor(t, dtype=torch.float32, device=torch.cuda.current_device())
+                            if not isinstance(t, torch.Tensor) or not t.is_cuda
+                            else t.to(device=torch.cuda.current_device())
+                            for t in rollout_data[field]
+                        ]
+
         return rollout_data
 
     def compute_log_prob(
