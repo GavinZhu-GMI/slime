@@ -186,6 +186,12 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         "sample_indices",
         "rollout_log_probs",
         "prompt",
+        # Additional RL training fields for forward_backward_only API
+        "advantages",
+        "returns",
+        "log_probs",
+        "ref_log_probs",
+        "values",
     ]:
         if key not in data:
             continue
