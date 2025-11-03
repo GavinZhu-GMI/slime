@@ -411,7 +411,10 @@ def sft_loss_function(args, batch, logits, sum_of_sample_mean):
         with_entropy=False,
     )
 
-    log_probs = log_probs_and_entropy["log_probs"]
+    log_probs = log_probs_and_entropy["log_probs"]  # List of per-sample tensors
+    # Keep per-sample logprobs for Tinker API (detach to avoid keeping computation graph)
+    per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
+
     log_probs = torch.cat(log_probs, dim=0)
     loss = -sum_of_sample_mean(log_probs)
 
@@ -423,6 +426,7 @@ def sft_loss_function(args, batch, logits, sum_of_sample_mean):
         loss,
         {
             "loss": loss.clone().detach(),
+            "log_probs": per_sample_log_probs,  # Per-sample logprobs for Tinker API
         },
     )
 
