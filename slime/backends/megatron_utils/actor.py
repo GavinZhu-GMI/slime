@@ -544,6 +544,17 @@ class MegatronTrainRayActor(TrainRayActor):
                 for key, value in zip(keys, values[1:]):
                     loss_dict[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
 
+                # Extract log_probs if present (added separately, not in keys/values tensor)
+                # Aggregate log_probs from all microbatches
+                if "log_probs" in losses_reduced[0]:
+                    # log_probs is a list of tensors (one per sample in batch)
+                    # With multiple microbatches, we need to concatenate across microbatches
+                    all_log_probs = []
+                    for x in losses_reduced:
+                        if "log_probs" in x and x["log_probs"]:
+                            all_log_probs.extend(x["log_probs"])
+                    loss_dict["log_probs"] = all_log_probs
+
         Timer().start("train_wait")
 
         return {

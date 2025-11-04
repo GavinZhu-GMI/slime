@@ -278,6 +278,8 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    # Keep per-sample logprobs for Tinker API (detach to avoid keeping computation graph)
+    per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
 
     if args.advantage_estimator == "gspo":
         full_log_probs = [
@@ -350,6 +352,7 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
+        "log_probs": per_sample_log_probs,  # Per-sample logprobs for Tinker API
     }
 
     if args.use_kl_loss:
@@ -393,6 +396,7 @@ def value_loss_function(args, batch, logits, sum_of_sample_mean):
     reported_loss = {
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),
+        "log_probs": [],  # Value loss doesn't produce per-token logprobs
     }
 
     return loss, reported_loss
@@ -467,17 +471,27 @@ def loss_function(args, batch, num_microbatches, logits):
         loss * num_microbatches / args.global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
     )
 
+    # Separate log_probs (list of tensors) from scalar metrics
+    # log_probs cannot be converted to a single tensor, so we handle it separately
+    log_probs = log.pop("log_probs", None)  # Remove log_probs if present
+
+    result_dict = {
+        "keys": list(log.keys()),
+        "values": torch.tensor(
+            [
+                num_samples if not args.calculate_per_token_loss else num_tokens,
+            ]
+            + list(log.values()),
+            device=logits.device,
+        ),
+    }
+
+    # Add log_probs back to the result dict (not in the tensor)
+    if log_probs is not None:
+        result_dict["log_probs"] = log_probs
+
     return (
         loss,
         num_tokens if args.calculate_per_token_loss else 1,
-        {
-            "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
-        },
+        result_dict,
     )
