@@ -262,7 +262,6 @@ def compute_advantages_and_returns(args, rollout_data):
 
 
 def policy_loss_function(args, batch, logits, sum_of_sample_mean):
-    advantages = torch.cat(batch["advantages"], dim=0)
     old_log_probs = batch["log_probs"]
 
     response_lengths = batch["response_lengths"]
@@ -278,8 +277,63 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+
+    # Check if we're on a non-last PP stage (no logits computed)
+    # Similar to check in compute_advantages_and_returns() at line 137
+    if not log_probs or len(log_probs) == 0:
+        # Return dummy loss - this rank doesn't compute the loss
+        return torch.tensor(0.0, device=logits.device if logits is not None else "cpu"), {}
+
+    # Handle dynamic batching: batch may contain more samples than the forward pass computed
+    # First, subset batch data to match the number of computed samples
+    num_samples_computed = len(log_probs)
+    old_log_probs = old_log_probs[:num_samples_computed]
+    response_lengths = response_lengths[:num_samples_computed]
+    total_lengths = total_lengths[:num_samples_computed]
+
+    # Filter out empty tensors from log_probs and match corresponding batch indices
+    # Empty tensors occur when get_log_probs_and_entropy() returns [0] for some samples
+    valid_indices = [i for i, lp in enumerate(log_probs) if lp.shape[0] > 0]
+
+    # Apply filter to all parallel lists
+    log_probs = [log_probs[i] for i in valid_indices]
+    old_log_probs = [old_log_probs[i] for i in valid_indices]
+    response_lengths = [response_lengths[i] for i in valid_indices]
+    total_lengths = [total_lengths[i] for i in valid_indices]
+
+    # Advantages need special handling since they're already concatenated per-sample
+    advantages = torch.cat([batch["advantages"][i] for i in valid_indices], dim=0)
+
     # Keep per-sample logprobs for Tinker API (detach to avoid keeping computation graph)
+    # IMPORTANT: Create AFTER filtering to ensure we only return valid (non-empty) log_probs
     per_sample_log_probs = [lp.clone().detach() for lp in log_probs]
+
+    # Filter loss_masks to match valid indices
+    loss_masks_filtered = [batch["loss_masks"][i] for i in valid_indices]
+
+    # Recreate sum_of_sample_mean with filtered data
+    # The original sum_of_sample_mean was created with unfiltered data, so we need to recreate it
+    from .cp_utils import get_sum_of_sample_mean
+    sum_of_sample_mean = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks_filtered,
+        args.calculate_per_token_loss,
+    )
+
+    # Debug logging to file (Ray actors don't show print output)
+    import os
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    with open(f"/tmp/grpo_debug_rank{rank}.log", "a") as f:
+        f.write(f"\n=== GRPO DEBUG RANK {rank} (AFTER FILTER) ===\n")
+        f.write(f"num_samples_computed={num_samples_computed}\n")
+        f.write(f"valid_indices={valid_indices}\n")
+        f.write(f"old_log_probs shapes: {[t.shape[0] for t in old_log_probs]}\n")
+        f.write(f"new log_probs shapes: {[t.shape[0] for t in log_probs]}\n")
+        f.write(f"response_lengths: {response_lengths}\n")
+        f.write(f"old_log_probs total tokens: {sum(t.shape[0] for t in old_log_probs)}\n")
+        f.write(f"new log_probs total tokens: {sum(t.shape[0] for t in log_probs)}\n")
 
     if args.advantage_estimator == "gspo":
         full_log_probs = [
@@ -300,7 +354,8 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
         ppo_kl = torch.cat(ppo_kl, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
     else:
-        old_log_probs = torch.cat(batch["log_probs"], dim=0)
+        # GRPO path (old_log_probs already subset above if needed)
+        old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
@@ -467,8 +522,10 @@ def loss_function(args, batch, num_microbatches, logits):
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
+    # Use actual batch size if provided (for variable batch sizes from tinker-cookbook)
+    actual_global_batch_size = batch.get("_actual_global_batch_size", args.global_batch_size)
     loss = (
-        loss * num_microbatches / args.global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
+        loss * num_microbatches / actual_global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
     )
 
     # Separate log_probs (list of tensors) from scalar metrics

@@ -179,8 +179,23 @@ def get_data_iterator(args, model, rollout_data):
     cp_size = mpu.get_context_parallel_world_size()
 
     num_local_samples = len(rollout_data["total_lengths"])
-    num_local_gbs = args.global_batch_size // dp_size
-    num_steps_per_rollout = num_local_samples // num_local_gbs
+
+    # FLEXIBLE BATCH SIZE: Support variable batch sizes from tinker-cookbook
+    # while preserving gradient accumulation semantics
+    target_local_batch_size = args.global_batch_size // dp_size
+
+    # Handle variable batch sizes gracefully
+    if num_local_samples <= target_local_batch_size:
+        # Small batch - process in one step (no gradient accumulation needed)
+        num_local_gbs = num_local_samples
+        num_steps_per_rollout = 1
+    else:
+        # Large batch - use gradient accumulation across multiple steps
+        num_local_gbs = target_local_batch_size
+        num_steps_per_rollout = (num_local_samples + num_local_gbs - 1) // num_local_gbs  # Ceiling division
+
+    # Pass actual batch size for loss scaling (used in loss.py)
+    rollout_data["_actual_global_batch_size"] = num_local_samples * dp_size
 
     def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
         data_iterator = []
