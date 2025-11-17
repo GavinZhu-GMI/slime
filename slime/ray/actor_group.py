@@ -161,6 +161,29 @@ class RayTrainGroup:
             ]
         )
 
+    def forward_only(self, rollout_id, rollout_data_ref):
+        """
+        Perform forward-only pass WITHOUT gradients, returning logprobs per sample.
+
+        This is used for DPO's forward_backward_custom where we need reference logprobs
+        from a forward pass, then apply custom loss function client-side.
+
+        Unlike forward_backward_only, this does NOT compute gradients.
+
+        Args:
+            rollout_id: Rollout identifier
+            rollout_data_ref: Reference to rollout data
+
+        Returns:
+            List of results from all actors (loss dict with log_probs)
+        """
+        return ray.get(
+            [
+                actor.forward_only_step.remote(rollout_id, rollout_data_ref)
+                for actor in self._actor_handlers
+            ]
+        )
+
     def apply_optimizer_step(self):
         """
         Apply optimizer step using accumulated gradients.

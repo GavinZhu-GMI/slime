@@ -4,7 +4,7 @@ import time
 from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import ray
 import torch
@@ -561,6 +561,68 @@ class MegatronTrainRayActor(TrainRayActor):
             "loss": loss_dict,
             "grad_norm": grad_norm if grad_norm is not None else 0.0,
             "valid_step": valid_step,
+        }
+
+    def forward_only_step(
+        self, rollout_id: int, rollout_data_ref: Box
+    ) -> Dict[str, Any]:
+        """
+        Perform forward-only pass WITHOUT gradients, returning logprobs per sample.
+
+        This is used for DPO's forward_backward_custom where we need reference logprobs
+        from a forward pass, then apply custom loss function client-side.
+
+        Unlike forward_backward_step_only, this does NOT compute gradients.
+
+        Args:
+            rollout_id: Rollout identifier
+            rollout_data_ref: Reference to rollout data
+
+        Returns:
+            Dictionary with loss_dict containing log_probs per sample
+        """
+        from megatron.core import mpu
+
+        from .loss import get_log_probs_and_entropy
+        from .model import forward_only
+
+        Timer().end("train_wait")
+
+        if self.args.offload:
+            self.wake_up(("model"))
+
+        with timer("data_preprocess"):
+            rollout_data = self._get_rollout_data(rollout_data_ref)
+
+        # Create data iterator
+        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+
+        with timer("forward_only"):
+            # Call forward_only which sets model to eval mode and does forward pass only
+            rollout_data_result = forward_only(
+                get_log_probs_and_entropy,
+                self.args,
+                self.model,
+                data_iterator,
+                num_microbatches,
+                store_prefix="",
+            )
+
+            # Extract log_probs from rollout_data_result
+            # forward_only returns dict with "log_probs" key containing list of tensors
+            loss_dict = {}
+            if mpu.is_pipeline_last_stage():
+                if "log_probs" in rollout_data_result:
+                    loss_dict["log_probs"] = rollout_data_result["log_probs"]
+                if "entropy" in rollout_data_result:
+                    loss_dict["entropy"] = rollout_data_result["entropy"]
+
+        Timer().start("train_wait")
+
+        return {
+            "loss": loss_dict,
+            "grad_norm": 0.0,  # No gradients computed in forward-only pass
+            "valid_step": True,  # Always valid since no gradient computation
         }
 
     def apply_optimizer_step(self) -> Dict[str, float]:
